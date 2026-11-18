@@ -1,0 +1,106 @@
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Tela compartilhada</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,sans-serif}
+video{width:100%;height:100%;object-fit:contain;background:#000;display:none}
+.c{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;text-align:center;padding:24px}
+h1{font-size:clamp(28px,4vw,56px);margin:0}#st{opacity:.7;font-size:clamp(16px,2vw,28px)}
+button{font-size:20px;padding:14px 28px;border:0;border-radius:10px;background:#2f7df6;color:#fff;cursor:pointer}
+button.stop{background:#d33}
+</style></head><body>
+<div id="dbg" style="position:fixed;left:8px;bottom:8px;z-index:9;font:14px monospace;opacity:.7;background:#0008;padding:4px 8px;border-radius:6px"></div>
+<video id="v" autoplay playsinline muted></video>
+<div class="c" id="c"><h1 id="t"></h1><div id="st"></div><button id="b" style="display:none"></button></div>
+<script>
+const SEND = location.pathname.split('/').filter(Boolean)[0]?.toLowerCase() === 'enviar';
+const id = Math.random().toString(36).slice(2, 10);
+const $ = s => document.getElementById(s);
+let ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+const iceReady = fetch('/ice').then(r => r.json()).then(j => { ICE = j; }).catch(() => {});
+const post = (to, msg) => fetch('/signal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ to, msg }) });
+const gathered = pc => new Promise(r => {
+  if (pc.iceGatheringState === 'complete') return r();
+  pc.addEventListener('icegatheringstatechange', () => pc.iceGatheringState === 'complete' && r());
+  setTimeout(r, 3000);
+});
+
+function viewer() {
+  $('t').textContent = 'Aguardando transmissão…';
+  let pc, stream;
+  const dbg = $('dbg');
+  const info = t => { dbg.textContent = t; };
+  const reset = () => { if (pc) { pc.close(); pc = null; } $('v').srcObject = null; $('v').style.display = 'none'; $('c').style.display = 'flex'; $('t').textContent = 'Aguardando transmissão…'; };
+  const es = new EventSource('/events?role=viewer&id=' + id);
+  es.onmessage = async e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'offer') {
+      await iceReady;
+      if (pc) pc.close();
+      pc = new RTCPeerConnection(ICE);
+      const mine = pc;
+      $('t').textContent = 'Conectando…';
+      mine.ontrack = ev => { stream = ev.streams[0]; };
+      const upd = () => {
+        info('conexão: ' + mine.connectionState + ' | ice: ' + mine.iceConnectionState);
+        if (mine !== pc) return;
+        if (mine.connectionState === 'connected') {
+          $('v').srcObject = stream; $('v').style.display = 'block'; $('c').style.display = 'none';
+          $('v').play().catch(err => info('play: ' + err.name));
+          setTimeout(() => { dbg.style.display = 'none'; }, 8000);
+        } else if (mine.connectionState === 'failed') {
+          $('t').textContent = 'Falha na conexão (rede bloqueando). Tentando de novo…';
+          dbg.style.display = 'block';
+          setTimeout(() => location.reload(), 4000);
+        }
+      };
+      mine.onconnectionstatechange = upd; mine.oniceconnectionstatechange = upd;
+      await mine.setRemoteDescription({ type: 'offer', sdp: m.sdp });
+      await mine.setLocalDescription(await mine.createAnswer());
+      await gathered(mine);
+      const kinds = (mine.localDescription.sdp.match(/typ (host|srflx|relay)/g) || []).join(',');
+      info('candidatos: ' + (kinds || 'nenhum'));
+      post('broadcaster', { type: 'answer', from: id, sdp: mine.localDescription.sdp });
+    } else if (m.type === 'stop') reset();
+  };
+  $('v').onclick = () => { $('v').muted = false; };
+}
+
+function sender() {
+  $('t').textContent = 'Transmitir para a TV';
+  $('st').textContent = 'Sua tela será exibida no mesmo link fixo da TV.';
+  const b = $('b'); b.style.display = ''; b.textContent = 'Começar transmissão';
+  let es, stream; const peers = {};
+  function stop(msg) {
+    if (es) es.close(); es = null;
+    Object.values(peers).forEach(p => p.close()); for (const k in peers) delete peers[k];
+    if (stream) stream.getTracks().forEach(t => t.stop()); stream = null;
+    b.textContent = 'Começar transmissão'; b.className = '';
+    $('st').textContent = typeof msg === 'string' ? msg : 'Transmissão encerrada.';
+  }
+  b.onclick = async () => {
+    if (stream) return stop();
+    try { stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true }); }
+    catch { $('st').textContent = 'Compartilhamento cancelado.'; return; }
+    stream.getVideoTracks()[0].onended = () => stop();
+    es = new EventSource('/events?role=broadcaster&id=' + id);
+    es.onmessage = async e => {
+      const m = JSON.parse(e.data);
+      if (m.type === 'viewer') {
+        if (peers[m.id]) peers[m.id].close();
+        await iceReady;
+        const pc = peers[m.id] = new RTCPeerConnection(ICE);
+        stream.getTracks().forEach(t => pc.addTrack(t, stream));
+        await pc.setLocalDescription(await pc.createOffer());
+        await gathered(pc);
+        post(m.id, { type: 'offer', sdp: pc.localDescription.sdp });
+      } else if (m.type === 'answer') {
+        const pc = peers[m.from];
+        if (pc && pc.signalingState === 'have-local-offer') await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
+      } else if (m.type === 'replaced') stop('Outra pessoa assumiu a transmissão.');
+    };
+    b.textContent = 'Parar transmissão'; b.className = 'stop';
+    $('st').textContent = 'Você está transmitindo para a TV.';
+  };
+}
+SEND ? sender() : viewer();
+</script></body></html>
